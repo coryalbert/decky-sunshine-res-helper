@@ -17,6 +17,7 @@ from src.drm import (
 
 log = logging.getLogger(__name__)
 from src.edid import create_edid, find_best_vic_resolution, get_pixel_clock_info
+from src.edid.parse import edid_supports_mode
 from src import steam_settings
 
 SCRIPT_DIR = Path(__file__).parent.parent.absolute()
@@ -24,6 +25,7 @@ STEAM_RES_STATE_FILE = SCRIPT_DIR / "gamescope_game_resolution_global.state"
 FC_STATE_FILE = SCRIPT_DIR / "gamescope_force_composite.state"
 HDR_STATE_FILE = SCRIPT_DIR / "gamescope_hdr_enabled.state"
 CONFIG_FILE = SCRIPT_DIR / "config.conf"
+PASSTHROUGH_FILE = SCRIPT_DIR / "passthrough.state"
 
 target_user = "deck"
 
@@ -131,6 +133,34 @@ def _get_target_uid() -> int:
     except KeyError:
         return 1000
 
+def _hardware_supports_mode(width: int, height: int, refresh_rate: int) -> bool:
+    """True if the real display's live EDID already lists exactly this mode."""
+    try:
+        _dev, card_name, port = find_global_active_display()
+        if not card_name or not port:
+            return False
+        edid = Path(f"/sys/class/drm/{card_name}-{port}/edid").read_bytes()
+        return edid_supports_mode(edid, width, height, refresh_rate)
+    except Exception as exc:
+        log.warning(f"  Could not read the display's EDID to check native modes: {exc}")
+        return False
+
+
+def _connect_passthrough(width: int, height: int, refresh_rate: int) -> bool:
+    """
+    The display natively supports a mode a custom EDID cannot carry (pixel clock above the
+    655 MHz EDID limit, e.g. 4K120). Leave the hardware EDID alone and let Gamescope pick
+    the display's own mode; only apply the Steam streaming overrides.
+    """
+    log.info(f"  {width}x{height}@{refresh_rate} is in the display's own EDID; leaving the EDID untouched")
+    _override_steam_settings(_get_config())
+    _ = PASSTHROUGH_FILE.write_text("1\n")
+    target_uid = _get_target_uid()
+    _ = run_command(f"sudo -u {target_user} XDG_RUNTIME_DIR=/run/user/{target_uid} gamescopectl backend_set_dirty")
+    log.info("✓ Native passthrough applied (no EDID override)")
+    return True
+
+
 def connect(width: int, height: int, refresh_rate: int, device: str | None = None, enable_hdr: bool = False) -> bool:
     """
     Connect a virtual display:
@@ -155,10 +185,13 @@ def connect(width: int, height: int, refresh_rate: int, device: str | None = Non
             _ = run_command(f"sh -c 'echo detect > /sys/class/drm/{stale_card}-{stale_port}/status'")
             time.sleep(0.5)
         state_file.unlink()
+    PASSTHROUGH_FILE.unlink(missing_ok=True)
 
     # Step 1: Generate custom EDID
     log.info("Step 1: Generating custom EDID...")
     pixel_clock_mhz, max_mhz, will_break = get_pixel_clock_info(width, height, refresh_rate)
+    if will_break and _hardware_supports_mode(width, height, refresh_rate):
+        return _connect_passthrough(width, height, refresh_rate)
     if will_break:
         vic_result = find_best_vic_resolution(width, height, refresh_rate)
         if vic_result:
@@ -243,6 +276,11 @@ def disconnect() -> bool:
     1. Turn off virtual display
     """
     log.info("Reverting display resolution override...")
+    if PASSTHROUGH_FILE.exists():
+        PASSTHROUGH_FILE.unlink()
+        log.info("  Native passthrough session (hardware EDID untouched): restoring Steam settings only")
+        _restore_steam_settings()
+        return True
     state_file = SCRIPT_DIR / "virt_display.state"
     if not state_file.exists():
         _restore_steam_settings()
